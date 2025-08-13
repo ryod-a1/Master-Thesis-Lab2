@@ -1,0 +1,859 @@
+'''
+Newtonian Cooling成分を除去して、
+水温の水平拡散成分を追加したもの
+'''
+
+#Yurijima等のサーバー系計算機で計算するときは、この下からコピーして使うこと
+# -*- coding: utf-8 -*-
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib import cm
+from matplotlib.colors import BoundaryNorm, LinearSegmentedColormap
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from IPython.display import HTML
+import time
+from scipy.spatial.distance import pdist, squareform
+from scipy.ndimage import median_filter
+
+#実行時間を計測
+start = time.time()
+
+#基本パラメータ
+Lx, Ly = 5.0, 5.0  #領域の大きさ[m]
+Nx, Ny, Nz = 50, 50, 1  #格子数
+Dx, Dy, Dz = Lx / Nx, Ly / Ny, 0.1  #格子幅[m]
+h = 0.1  #水深[m]
+g = 9.81  #重力加速度[m/s^2]
+alpha = 2.3e-4  #熱膨張係数[/K]
+c_sea = 0.95 * 4184  #海水の比熱[J/(kg·K)]
+rho_sea = 1025  #海水密度[kg/m^3]
+gamma = 1 / (60 * 60 * 24) #Damping(減衰)パラメータ
+T0 = 27.0 #hより下の層のオリジナル水温
+Q = 1000  #与熱量[W/m^2]
+
+#プラスチック粒子情報 ポリスチレンを想定している
+num_particles = 2000 #粒子の数[個]
+d_plastic = 0.005 #粒子の直径[m]
+A_particle = np.pi * (d_plastic / 2) ** 2 #真上から見た時の粒子一つあたりが面積[m^2]
+albedo_sea = 0.06 #海水のアルベド
+albedo_particle = 1.0 #粒子のアルベド
+Kx, Ky = 1e-6, 1e-6 #拡散係数 [m^2 / s] (0.01 [cm^2/s])
+
+#プラスチック初期位置設定
+positions = []
+
+#ランダム配置
+positions = np.random.rand(num_particles, 2) * Lx  
+
+#特定の位置に集中して配置
+#Initial_location_parameter = 1.0
+
+#for _ in range(num_particles):　
+#r = np.sqrt(np.random.rand()) * Initial_location_parameter  
+#theta = np.random.rand() * 2 * np.pi
+#x = Lx / 2 + r * np.cos(theta)
+#y = Ly / 2 + r * np.sin(theta)
+#positions.append([x, y])
+
+positions = np.array(positions)
+
+#時間ステップ
+dt = 0.05 #単位時間[s]
+running_second = 60 * 60 * 24 * 3 * 1 #秒
+num_steps = int(running_second / dt) #総step数：int([sec] * [min] * [hour] * [day] * [year]) 
+step_interval = int(60 * 1 * (1/dt)) #設定したstep数だけスキップする。つまり、step_intervalごとに表示、計算など
+
+#座標定義
+x = np.linspace(0, Lx, Nx)
+y = np.linspace(0, Ly, Ny)
+X, Y = np.meshgrid(x, y, indexing='ij')
+x_center, y_center = Lx / 2, Ly / 2 #全領域の中心点
+r = np.sqrt((X - x_center) ** 2 + (Y - y_center) ** 2) #領域中心からの距離を三平方の定理で算出
+
+#パラメータの初期化
+T_water = np.full((Nx, Ny), T0)
+eta = np.zeros((Nx, Ny))
+u = np.zeros((Nx + 1, Ny))
+v = np.zeros((Nx, Ny +1))
+w = np.zeros((Nx, Ny))
+Q_effective =np.zeros((Nx, Ny))
+dT_dt =np.zeros((Nx, Ny))
+
+#カラーマップ
+#水温マップ
+colors_temp = [(0, "blue"), (0.2, "cyan"), (0.4, "green"), (0.6, "yellow"), (0.8, "orange"), (1, "red")]
+custom_cmap_temp = LinearSegmentedColormap.from_list("custom_cmap_temp", colors_temp)
+bounds_temp = np.linspace(-0.0001, 0.0001, 201)
+norm_temp = BoundaryNorm(bounds_temp, custom_cmap_temp.N)
+#水位マップ
+colors_eta = [(0, "blue"), (0.2, "cyan"), (0.4, "green"), (0.6, "yellow"), (0.8, "orange"), (1, "red")]
+custom_cmap_eta = LinearSegmentedColormap.from_list("custom_cmap_eta", colors_eta)
+bounds_eta = np.linspace(-1e-7, 1e-7, 201)
+norm_eta = BoundaryNorm(bounds_eta, custom_cmap_eta.N)
+#粒子数マップ
+colors_particle_count = [(0, "blue"), (0.2, "cyan"), (0.4, "green"), (0.6, "yellow"), (0.8, "orange"), (1, "red")]
+custom_cmap_particle_count = LinearSegmentedColormap.from_list("custom_cmap_temp", colors_particle_count)
+bounds_particle_count = np.linspace(0, 11, 12)
+norm_particle_count = BoundaryNorm(bounds_particle_count, custom_cmap_particle_count.N)
+
+
+#プロット
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+#出力1: 水温マップ
+img1 = ax1.imshow(T_water, origin='lower', cmap=custom_cmap_temp, norm=norm_temp, extent=[0, Lx, 0, Ly])
+cbar1 = fig.colorbar(img1, ax=ax1, label="Temperature (K)")
+scat1 = ax1.scatter(positions[:, 0], positions[:, 1], s=3, c='white', alpha=0.7, label='Particles')
+ax1.set_title("Temperature")
+ax1.set_xlabel("X [m]")
+ax1.set_ylabel("Y [m]")
+ax1.set_aspect('equal')
+ax1.grid(True, alpha=0.3)
+
+#出力2: 格子内粒子数マップ
+img2 = ax2.imshow(np.zeros((Nx, Ny)), origin='lower', cmap=custom_cmap_particle_count, norm=norm_particle_count, extent=[0, Lx, 0, Ly])
+cbar2 = fig.colorbar(img2, ax=ax2, ticks=bounds_particle_count, spacing='uniform', label="Particles in a cell")
+scat2 = ax2.scatter(positions[:, 0], positions[:, 1], s=3, c='white', alpha=0.7, label='Particles')
+ax2.set_title("Particles in a cell")
+ax2.set_xlabel("X [m]")
+ax2.set_ylabel("Y [m]")
+ax2.set_aspect('equal')
+ax2.grid(True, alpha=0.3)
+
+
+#流速ベクトル準備
+#Indexの値まで間引く
+#thinning_index = 5
+
+#流速ベクトルの表示位置は、格子の中心点
+#center_x = (np.arange(Nx) + 0.5) * Dx
+#center_y = (np.arange(Ny) + 0.5) * Dy
+#center_X, center_Y = np.meshgrid(center_x, center_y, indexing='ij')
+
+#間引いて表示
+#center_X_thinned = center_X[::thinning_index, ::thinning_index]
+#center_Y_thinned = center_Y[::thinning_index, ::thinning_index]
+
+#流速ベクトル用の矢印の初期化
+#quiver1 = ax1.quiver(center_X_thinned, center_Y_thinned, np.zeros_like(center_X_thinned), np.zeros_like(center_Y_thinned), color='white', scale_units='xy', angles='xy', scale=1, width=0.005)
+#quiver2 = ax2.quiver(center_X_thinned, center_Y_thinned, np.zeros_like(center_X_thinned), np.zeros_like(center_Y_thinned), color='white', scale_units='xy', angles='xy', scale=1, width=0.005)
+
+#Referenceベクトル
+#ref_length = Dx
+#ref_start = np.array([[0.85 * Lx, 0.1 * Ly]])
+#ref_U = np.array([ref_length])
+#ref_V = np.array([0.0])
+#ax1.quiver(ref_start[:, 0], ref_start[:, 1], ref_U, ref_V, color='white', angles='xy', scale_units='xy', scale=1, width=0.01)
+#ax2.quiver(ref_start[:, 0], ref_start[:, 1], ref_U, ref_V, color='white', angles='xy', scale_units='xy', scale=1, width=0.01)
+#ax1.text(0.85 * Lx, 0.05 * Ly, '1e-5 m/s', color='white', ha='center', va='center')
+#ax2.text(0.85 * Lx, 0.05 * Ly, '1e-5 m/s', color='white', ha='center', va='center')
+
+
+#メインアップデート関数
+def update_fields(u, v, eta, T_water, positions):
+    u_old   = u.copy()               
+    v_old   = v.copy()       
+    eta_old = eta.copy()   
+    T_water_old   = T_water.copy()
+
+    num_p_lattice = np.zeros((Nx, Ny))
+    eta = np.zeros((Nx, Ny))
+    u = np.zeros((Nx + 1, Ny))
+    v = np.zeros((Nx, Ny + 1))
+    w = np.zeros((Nx, Ny))
+    dT_dt = np.zeros((Nx, Ny))
+    du_dx = np.zeros((Nx, Ny))
+    dv_dy = np.zeros((Nx, Ny))
+    duT_dx = np.zeros((Nx, Ny))
+    dvT_dy = np.zeros((Nx, Ny))
+    dwT_dz = np.zeros((Nx, Ny))
+
+    #粒子数からQ_effectiveを計算
+    #高速化したやつ
+    hist2d, _, _ = np.histogram2d(positions[:, 0], positions[:, 1], bins=[Nx, Ny], range=[[0, Lx], [0, Ly]])
+    num_p_lattice = hist2d.astype(int)
+
+    #冷却に対応していないので、1より大きくならないようにclip
+    plastic_fraction = np.clip((num_p_lattice * A_particle) / (Dx * Dy), 0.0, 1.0)
+
+    A_composite = (1 - plastic_fraction) * albedo_sea + plastic_fraction * albedo_particle
+    Q_effective = (1 - A_composite) * Q
+
+    #dT/dt を上流差分 + 鉛直流 + Q から計算
+    for i in range(Nx):
+        for j in range(Ny):
+            #セルのmod(ic, jc)
+            icL = (i - 1) % Nx
+            icR = (i + 1) % Nx
+            jcD = (j - 1) % Ny
+            jcU = (j + 1) % Ny
+
+            #流速(face)のmod(if, jf)
+            ifL = i
+            ifR = (i + 1) % (Nx + 1)
+            jfD = j                 
+            jfU = (j + 1) % (Ny + 1)
+            
+            #格子に対する熱の流出入計算
+            
+            #uについて
+            #duT_dx[i, j] = (u[i+1, j] * (f * T_water[i, j] + (1 - f) * T_water[i+1, j]) - u[i, j] * (f * T_water[i-1, j] + (1-f) * T_water[i, j])) / Dx に従う
+            #格子全体として右流れか左流れかで判定する
+
+            if u_old[ifR, j] >= 0: #右流れのときは f = 1
+                duT_dx[i, j] = (u_old[ifR, j] * T_water_old[i, j] - u_old[ifL, j] * T_water_old[icL, j]) / Dx #右から出ていく - 左から入ってくる
+            else: #左流れのときは f = 0
+                duT_dx[i, j] = (u_old[ifR, j] * T_water_old[icR, j] - u_old[ifL, j] * T_water_old[i, j]) / Dx #右から入ってくる - 左から出ていく
+
+            #vについて
+            #dvT_dy[i, j] = (v[i, j+1] * (f * T_water[i, j] + (1 - f) * T_water[i, j+1]) - v[i, j] * (f * T_water[i, j-1] + (1-f) * T_water[i, j])) / Dy に従う
+            #格子全体として上流れか下流れかで判定する
+
+            if v_old[i, jfU] >= 0: #上流れのときは f = 1
+                dvT_dy[i, j] = (v_old[i, jfU] * T_water_old[i, j] - v_old[i, jfD] * T_water_old[i, jcD]) / Dy #上から出ていく - 下から入ってくる
+            else: #下流れのときは f = 0
+                dvT_dy[i, j] = (v_old[i, jfU] * T_water_old[i, jcU] - v_old[i, jfD] * T_water_old[i, j]) / Dy #上から入ってくる - 下から出ていく
+
+            #w計算（下向きが正）
+            du_dx[i, j] = (u_old[ifR, j] - u_old[ifL, j]) / Dx
+            dv_dy[i, j] = (v_old[i, jfU] - v_old[i, jfD]) / Dy
+            w[i, j] = - h * (du_dx[i, j] + dv_dy[i, j])
+
+            if w[i, j] >= 0: #w>0→正方向→下向き→下降流
+                dwT_dz[i, j] = w[i, j] * T_water_old[i, j] / h  
+                
+            else: #w<0→負方向→下向き正→上昇流
+                dwT_dz[i, j] = w[i, j] * T0 / h
+            
+            #T_water, η の更新
+            #さらに、拡散成分を追加
+            laplacian_T = (T_water_old[icR, j] + T_water_old[icL, j] - 4 * T_water_old[i, j] + T_water_old[i, jcU] + T_water_old[i, jcD])
+            dT_dt[i, j] = - duT_dx[i, j] - dvT_dy[i, j] - dwT_dz[i, j] + (Q_effective[i, j] / (rho_sea * h * c_sea)) + ((Kx * laplacian_T) / (Dx**2))
+            
+            #主人公格子[i, j]とその左[iL, j]またはその下[i, jD]の間の流速がu[i, j]またはv[i, j]であることを定義
+            d_eta_dx = (eta_old[i, j] - eta_old[icL, j]) / Dx
+            d_eta_dy = (eta_old[i, j] - eta_old[i, jcD]) / Dy
+                
+            #u, v の新しい値を η 勾配から計算
+            #さらに、Reileigh frictionを追加
+            u[i, j] = u_old[i, j] - g * d_eta_dx * dt - (gamma * u_old[i, j]) * dt
+            v[i, j] = v_old[i, j] - g * d_eta_dy * dt - (gamma * v_old[i, j]) * dt
+
+    #周期境界条件
+    u[-1, :] = u[0, :] #領域の左端の流速 = 右端の流速
+    v[:, -1] = v[:, 0] #領域の下端の流速 = 上端の流速
+
+    #T/etaの更新
+    T_water = T_water_old + dT_dt * dt
+    eta = eta_old + alpha * dT_dt * h * dt
+
+    return u, v, eta, T_water
+
+
+#粒子エントロピーを計算するための関数
+def compute_entropy_p(positions, Nx, Ny, Lx, Ly):
+    hist2d, _, _ = np.histogram2d(positions[:, 0], positions[:, 1], bins=[Nx, Ny], range=[[0, Lx], [0, Ly]])
+    p = hist2d.flatten() / np.sum(hist2d)
+    p_nonzero = p[p > 0]
+    entropy_p = - np.sum(p_nonzero * np.log(p_nonzero))
+
+    #0～1の範囲に正規化
+    entropy_p = entropy_p / np.log(Nx * Ny)
+    
+    return entropy_p
+
+
+#水温エントロピーを計算するための関数
+#2値化(0 or 1)した水温場からShannonエントロピーを計算（entropy_Tとして返す）    
+def compute_entropy_T(T_water):
+    mean_T = np.mean(T_water) #水温の平均
+    std_T = np.std(T_water) #水温の標準偏差
+    deviation = np.abs(T_water - mean_T) #偏差：水温の平均値からの差の絶対値
+
+    #偏差が標準偏差以下→問題ないので0、それ以上→外れ値（偏差がデカすぎ）なので1
+    binary_map = (deviation > std_T).astype(int) #binary_mapはNx×Nyのサイズで、すべての格子に0または1が割り振られる
+
+    #0と1の割合を計算
+    total_cells = binary_map.size #50×50のサイズ
+    count_0 = np.count_nonzero(binary_map == 0) #binary_map == 0でTrueを返す #mnp.count_nonzero()は非ゼロ(True = 0)の値を数える関数
+    count_1 = total_cells - count_0
+
+    p0 = count_0 / total_cells #0を返す確率
+    p1 = count_1 / total_cells #1を返す確率
+
+    #エントロピー計算（0や1だけの状態も考慮）
+    entropy_T = 0
+    
+    if p0 > 0:
+        entropy_T -= p0 * np.log(p0)
+    if p1 > 0:
+        entropy_T -= p1 * np.log(p1)
+
+    #0～1の範囲に正規化
+    entropy_T = entropy_T / np.log(2)
+
+    return entropy_T
+
+#上記の水温エントロピーに変わり、パッチネスの度合いを計算するパラメータを計算(Moran's I)
+
+def compute_morans_I(T_water):
+    Nx, Ny = T_water.shape
+    N = Nx * Ny
+    T_flat = T_water.flatten()
+    T_mean = np.mean(T_flat)
+    W = np.zeros((N, N))
+
+    # 単純な4近傍を重み1とする（または距離で加重）
+    for i in range(N):
+        xi, yi = divmod(i, Ny)
+        for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
+            xj, yj = xi + dx, yi + dy
+            if 0 <= xj < Nx and 0 <= yj < Ny:
+                j = xj * Ny + yj
+                W[i, j] = 1
+
+    # モランのIの計算
+    numerator = np.sum(W * (T_flat - T_mean).reshape(-1, 1) * (T_flat - T_mean))
+    denominator = np.sum((T_flat - T_mean)**2)
+    I = (N / np.sum(W)) * (numerator / denominator)
+    return I
+
+#update_field()関数を呼び出して関数を全ステップ実行
+max_T_list = []
+min_T_list = []
+max_Tdiff_list = []
+min_Tdiff_list = []
+max_eta_list = []
+min_eta_list = []
+max_etadiff_list = []
+min_etadiff_list = []
+
+T_water_all = []
+T_diff_all = []
+eta_all = []
+eta_diff_all = []
+u_all = []
+v_all = []
+positions_all = []
+
+snapshots = [] #元データを格納
+snapshots_diff = [] #元データの平均値からの偏差を格納
+snapshots_vector = [] #元データを使って流速ベクトルを表示
+entropies_p = [] #粒子エントロピーを格納
+entropies_T = [] #水温エントロピーを格納
+Morans_I = [] #Moran's Iを格納
+correlation_T_p = []
+
+
+#関数呼び出しループ
+for step in range(num_steps + 1):
+    u, v, eta, T_water = update_fields(u, v, eta, T_water, positions)
+
+    R_x = np.random.normal(0, 1, num_particles) #Random Walkのための、平均0、標準偏差1の乱数を生成
+    R_y = np.random.normal(0, 1, num_particles) #Random Walkのための、平均0、標準偏差1の乱数を生成
+
+    for p in range(num_particles):
+        px, py = positions[p]
+        ix = int(px / Dx) % Nx #x方向について、何番目の格子にいるかを判定
+        iy = int(py / Dy) % Ny #y方向について、何番目の格子にいるかを判定
+        positions[p, 0] += R_x[p] * np.sqrt(2 * Kx * dt) + u[ix, iy] * dt #Random Walk + 水温差によって生成されたuで横方向に粒子が動く
+        positions[p, 1] += R_y[p] * np.sqrt(2 * Ky * dt) + v[ix, iy] * dt #Random Walk + 水温差によって生成されたvで縦方向に粒子が動く
+        positions[p, 0] %= Lx #折り返し条件(x)
+        positions[p, 1] %= Ly #折り返し条件(y)
+
+    #全体平均からの偏差でアニメーションを表示（温度、水位）
+    T_diff = T_water - np.mean(T_water)
+    eta_diff = eta - np.mean(eta)
+    
+    #回転＋左右反転（可視化専用）
+    #T_water_vis = np.fliplr(np.rot90(T_water, k=-1))
+    #eta_vis = np.fliplr(np.rot90(eta, k=-1))
+    #T_diff_vis = np.fliplr(np.rot90(T_diff, k=-1))
+    #eta_diff_vis = np.fliplr(np.rot90(eta_diff, k=-1))
+    u_vis = np.fliplr(np.rot90(u, k=-1))
+    v_vis = np.fliplr(np.rot90(v, k=-1))
+    w_vis = np.fliplr(np.rot90(w, k=-1))
+
+    
+    #step_intervalごとにスナップショットを保存
+    if step % step_interval == 0:
+        
+        print(f"Steps:{step}")
+        
+        #print("T_water_vis:")
+        #for i in range(Nx):
+            #row = "  ".join([f"{T_water_vis[i, j]:.6f}" for j in range(Ny)])
+            #print(row)
+        
+        #print("")
+        
+        #print("eta_vis:")
+        #for i in range(Nx):
+            #row = "  ".join([f"{eta_vis[i, j]:.6e}" for j in range(Ny)])
+            #print(row)
+        
+        #print("")
+
+        print("u_vis:")
+        for i in range(Nx):
+            row = "  ".join([f"{u_vis[i, j]:.6e}" for j in range(Ny+1)])
+            print(row)
+        
+        #print("")
+        
+        #du_dx_rotated = np.rot90(du_dx, k=1)
+        #print("du_dx_rotated:")
+        #for i in range(Nx):
+            #row = "  ".join([f"{du_dx_rotated[i, j]:.6e}" for j in range(Ny)])
+            #print(row)
+        
+        #print("")
+        
+        #print("dT_dt:")
+        #for i in range(Nx):
+            #row = "  ".join([f"{dT_dt[i, j]:.6e}" for j in range(Ny)])
+            #print(row)
+
+        #データ格納
+        #max_T_list.append(np.max(T_water))
+        #min_T_list.append(np.min(T_water))
+
+        max_Tdiff_list.append(np.max(T_diff))
+        min_Tdiff_list.append(np.min(T_diff))
+
+        #max_eta_list.append(np.max(eta))
+        #min_eta_list.append(np.min(eta))
+
+        max_etadiff_list.append(np.max(eta_diff))
+        min_etadiff_list.append(np.min(eta_diff))
+
+        entropy_p = compute_entropy_p(positions, Nx, Ny, Lx, Ly)
+        entropies_p.append(entropy_p)
+        
+        print(f"Entropy(Particle): {entropy_p:.6f}")
+
+        entropy_T = compute_entropy_T(T_water)
+        entropies_T.append(entropy_T)
+
+        print(f"Entropy(Temperature): {entropy_T:.6f}")
+
+        I = compute_morans_I(T_water)
+        Morans_I.append(I)
+
+        print(f"Morans_I: {I:.6f}")
+
+        # 粒子数マップ
+        hist2d, _, _ = np.histogram2d(positions[:, 0], positions[:, 1], bins=[Nx, Ny], range=[[0, Lx], [0, Ly]])
+        num_p_lattice = hist2d.astype(float)
+
+        particle_counts = hist2d #T_waterと同じ形状に整形
+        
+        # 相関係数の計算（1次元に変換して）
+        T_flat = T_water.flatten()
+        P_flat = num_p_lattice.flatten()
+        
+        if np.std(P_flat) > 0 and np.std(T_flat) > 0:  #ゼロ除算を防ぐ
+            correlation = np.corrcoef(P_flat, T_flat)[0, 1]
+        else:
+            correlation = np.nan
+
+        correlation_T_p.append(correlation)
+        
+        print(f"Correlation(Particles - Temp): {correlation:.6f}")
+        print("")
+
+
+        #元データT_water, eta, positionsを保存する場合
+        #snapshots.append((T_water.copy(), eta.copy(), positions.copy()))
+
+        #元データの平均値からの偏差を保存する場合
+        snapshots_diff.append((T_diff.copy(), eta_diff.copy(), positions.copy()))
+
+        #流速ベクトルを表示する場合
+        #snapshots_vector.append(( T_diff.copy(), eta_diff.copy(), positions.copy(), u.copy(), v.copy() ))
+
+    
+    #最後の60秒間での特別処理
+    final_duration = 60  # 最後の60秒間
+    final_steps = int(final_duration / dt)
+    step_interval_final = int(1 / dt)  # 1秒ごとに保存
+    
+    # stepループ内の末尾で以下を追加
+    if step > num_steps - final_steps:
+        if step % step_interval_final == 0 and (step % step_interval != 0):  # 重複回避
+            snapshots_diff.append((T_diff.copy(), eta_diff.copy(), positions.copy()))
+
+
+#絶対必要な処理！！！！
+#粒子位置反転＆時計回り90度回転関数(x, y)→(y, x)
+def rotate_and_flip_positions(pos, Lx, Ly):
+    x, y = pos[:, 0], pos[:, 1]
+    x_rotated = y
+    y_rotated = x
+    return np.column_stack((x_rotated, y_rotated))
+    
+#Animation生成
+#Quiver comment out
+def animate(frame):
+    #ref_speed = 1e-5  #参照速度[m/s]
+
+    #元データで描画するとき
+    #T, e, pos = snapshots_[frame]
+
+    #元データの平均値からの偏差で描画するとき
+    T, e, pos = snapshots_diff[frame]
+
+    #元データを利用してベクトルを描画するとき
+    #T,eta, pos, u, v = snapshots_vector[frame]
+      
+    img1.set_data(T)
+
+    rotated_pos = rotate_and_flip_positions(pos, Lx, Ly)
+    scat1.set_offsets(rotated_pos)
+    scat2.set_offsets(rotated_pos)
+
+    hist2d, _, _ = np.histogram2d(pos[:, 0], pos[:, 1], bins=[Nx, Ny], range=[[0, Lx], [0, Ly]])
+    #img2.set_data(hist2d.T)  # 転置で方向合わせ
+    img2.set_data(hist2d)
+    
+    #正味の流速を計算
+    #u_net = np.zeros((Nx, Ny))
+    #v_net = np.zeros((Nx, Ny))
+
+    #for i in range(Nx):
+        #for j in range(Ny):
+            #u_net[i, j] = u[i + 1, j] + u[i, j]  #出ていく右辺 - 入ってくる左辺
+            #v_net[i, j] = v[i, j + 1] + v[i, j]  #出ていく上辺 - 入ってくる下辺
+
+    #Referenceベクトルでスケーリング
+    #u_norm = u_net / ref_speed
+    #v_norm = v_net / ref_speed
+
+    #間引き表示
+    #u_thinned = u_norm[::thinning_index, ::thinning_index]
+    #v_thinned = v_norm[::thinning_index, ::thinning_index]
+
+    #quiver1.set_UVC(u_thinned, v_thinned)
+    #quiver2.set_UVC(u_thinned, v_thinned)
+
+    return img1, img2, scat1, scat2
+    #return img1, img2, scat1, scat2, quiver1, quiver2
+    
+
+#アニメーションとして保存
+#元データで作図するとき
+#ani = animation.FuncAnimation(fig,animate,frames=len(snapshots),blit=False)
+
+#元データの平均値からの偏差で作図するとき
+ani = animation.FuncAnimation(fig,animate,frames=len(snapshots_diff),blit=False)
+
+#元データを利用して流速ベクトルを作図するとき
+#ani = animation.FuncAnimation(fig,animate,frames=len(snapshots_vector),blit=False)
+
+ani.save("2000_3days_re.mp4")
+
+#with open("animation_1day_100 lattices.html", "w") as f:
+    #f.write(ani.to_jshtml())
+#HTML(ani.to_jshtml())
+
+#各種グラフ描画
+#水温 最大・最小値表示
+run_time = np.arange(len(max_T_list))
+run_time_hour = run_time / 60
+plt.figure(figsize=(10, 5))
+plt.plot(run_time_hour, max_T_list, label='Max T_water')
+plt.plot(run_time_hour, min_T_list, label='Min T_water')
+plt.xlabel("Time [hour]")
+plt.ylabel("T_water [K]")
+plt.title("Water Temperature Max/Min Transition")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig("T_water_max_min_transition_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+#水温空間偏差 最大・最小値表示
+run_time = np.arange(len(max_Tdiff_list))
+run_time_hour = run_time / 60
+plt.figure(figsize=(10, 5))
+plt.plot(run_time_hour, max_Tdiff_list, label='Max T_diff')
+plt.plot(run_time_hour, min_Tdiff_list, label='Min T_diff')
+plt.xlabel("Time [hour]")
+plt.ylabel("T_diff [K]")
+plt.title("Water Temperature Spatial Deviation Max/Min Transition")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig("T_diff_max_min_transition_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+#水位 最大・最小値表示
+run_time = np.arange(len(max_eta_list))
+run_time_hour = run_time / 60
+plt.figure(figsize=(10, 5))
+plt.plot(run_time_hour, max_eta_list, label='Max eta')
+plt.plot(run_time_hour, min_eta_list, label='Min eta')
+plt.xlabel("Time [hour]")
+plt.ylabel("eta [m]")
+plt.title("Water Surface Height Max/Min Transition")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig("eta_max_min_transition_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+#水位空間偏差 最大・最小値表示
+run_time = np.arange(len(max_etadiff_list))
+run_time_hour = run_time / 60
+plt.figure(figsize=(10, 5))
+plt.plot(run_time_hour, max_etadiff_list, label='Max eta_diff')
+plt.plot(run_time_hour, min_etadiff_list, label='Min eta_diff')
+plt.xlabel("Time [hour]")
+plt.ylabel("eta_diff [m]")
+plt.title("Water Surface Height Max/Min Transition")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig("eta_diff_max_min_transition_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#粒子Entropy表示
+run_time = np.arange(len(entropies_p))
+run_time_hour = run_time / 60
+plt.figure(figsize=(10, 5))
+plt.plot(run_time_hour, entropies_p)
+plt.xlabel("Time [hour]")
+plt.ylabel("Entropy (Particle)")
+plt.title("Shannon Entropy of Particles")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("Shannon Entropy of Particles_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#粒子Entropy FFT表示
+sampling_interval = step_interval * dt
+sampling_rate = 1 / sampling_interval
+F_p = np.fft.fft(entropies_p)
+F_p_freq = np.fft.fftfreq(len(entropies_p), d = sampling_interval)
+positive_freqs = F_p_freq[1:len(F_p_freq)//2]
+positive_amplitudes = np.abs(F_p[1:len(F_p)//2])
+
+plt.figure(figsize=(10, 5))
+plt.plot(positive_freqs, positive_amplitudes)  #周波数 [Hz]
+plt.xlabel("Frequency [Hz]")
+plt.ylabel("Amplitude")
+plt.title("FFT of Shannon Entropy of Particles")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("FFT of Shannon Entropy of Particles_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#水温Entropy表示
+run_time = np.arange(len(entropies_T))
+run_time_hour = run_time / 60
+plt.figure(figsize=(10, 5))
+plt.plot(run_time_hour, entropies_T)
+plt.xlabel("Time [hour]")
+plt.ylabel("Entropy (Temperature)")
+plt.title("Shannon Entropy of Temperature")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("Shannon Entropy of Temperature_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#水温Entropy(最初の増加分をカットしたバージョン）
+plt.figure(figsize=(10, 5))
+plt.plot(run_time_hour, entropies_T)
+plt.xlim(0.5, run_time_hour[-1])
+plt.ylim(0.85, 0.95)
+plt.xlabel("Time [hour]")
+plt.ylabel("Entropy (Temperature)")
+plt.title("Shannon Entropy of Temperature(Edited)")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("Shannon Entropy of Temperature(Edited)_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#水温Entropy FFT表示
+sampling_interval = step_interval * dt  #1ステップの時間 [秒]
+sampling_rate = 1 / sampling_interval   #サンプリングレート [Hz]
+F_T_water = np.fft.fft(entropies_T)
+F_T_water_freq = np.fft.fftfreq(len(entropies_T), d = sampling_interval)
+positive_freqs = F_T_water_freq[1:len(F_T_water_freq)//2]
+positive_amplitudes = np.abs(F_T_water[1:len(F_T_water)//2])
+
+plt.figure(figsize=(10, 5))
+plt.plot(positive_freqs, positive_amplitudes)
+plt.xlabel("Frequency [Hz]")
+plt.ylabel("Amplitude")
+plt.title("FFT of Shannon Entropy of Temperature")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("FFT of Shannon Entropy of Temperature_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#Moran's I
+run_time = np.arange(len(Morans_I))
+run_time_hour = run_time / 60
+plt.figure(figsize=(8, 5))
+plt.plot(run_time_hour, Morans_I)
+plt.xlabel("Time [hour]")
+plt.ylabel("Moran's I")
+plt.title("Temporal Change of Spatial Patchiness (Moran's I)")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("Moran's I_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#Moran's I Detrend
+#線形増加成分を最小二乗法で除去
+run_time_cut = np.arange(len(Morans_I)) / 60   # hour 単位
+
+#線形トレンドを回帰して除去(Dtrend処理）
+coef = np.polyfit(np.arange(len(Morans_I)), Morans_I, 1)
+trend = np.polyval(coef, np.arange(len(Morans_I)))
+
+#トレンドを除去
+Morans_I_detrended = Morans_I - trend
+
+#周期成分の抽出（波形の上下を見る）
+positive_indices = np.where(Morans_I_detrended > 0)[0]
+negative_indices = np.where(Morans_I_detrended < 0)[0]
+
+plt.figure(figsize=(8, 5))
+plt.plot(run_time_cut, Morans_I_detrended)
+plt.xlabel("Time [hour]")
+plt.ylabel("Detrended Moran's I")
+plt.title("Moran's I (Detrended)")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("MoransI_detrended_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#Moran's I FFT
+sampling_interval = step_interval * dt  #時間のステップ間隔 [秒]
+sampling_rate = 1 / sampling_interval   #サンプリングレート [Hz]
+F_I = np.fft.fft(Morans_I)
+F_I_freq = np.fft.fftfreq(len(Morans_I), d=sampling_interval)
+positive_freqs = F_I_freq[1:len(F_I_freq)//2]
+positive_amplitudes = np.abs(F_I[1:len(F_I)//2])
+
+plt.figure(figsize=(10, 5))
+plt.plot(positive_freqs, positive_amplitudes)
+plt.xlabel("Frequency [Hz]")
+plt.ylabel("Amplitude")
+plt.title("FFT of Moran's I (Water Temperature Patchiness)")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("FFT of Moran's I_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#水温-粒子数マップの相関係数時系列変化
+plt.figure(figsize=(10,5))
+plt.plot(np.arange(len(correlation_T_p)) / 60, correlation_T_p)
+plt.xlabel("Time [hour]")
+plt.ylabel("Correlation Coefficient")
+plt.title("Correlation between T_water and Particle Count")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("Correlation between T_water and Particle Count_2000_3days_re.png", dpi=300)
+plt.show()
+
+
+#Hovmoller図（x=2.5[m]におけるX軸方向の50格子の水温時間変化を2次元マップに落とし込む)
+#30分毎で間引き
+snapshots_diff_thinned = snapshots_diff[::30] 
+
+#x=2.5[m]のy軸方向の格子を抽出
+i_center = Ny // 2
+
+#時間×空間の水温マトリクスを作成
+T_y_matrix = np.array([snap[0][i_center, :] for snap in snapshots_diff_thinned])
+
+#5×5 メディアンフィルターを適用
+T_y_matrix_filtered = median_filter(T_y_matrix, size=(5, 5))
+
+plt.figure(figsize=(10, 6))
+extent = [0, Lx, 0, len(T_y_matrix_filtered) * 0.5]
+plt.imshow(T_y_matrix_filtered, aspect='auto', cmap='jet', origin='lower', extent=extent, interpolation='nearest', vmin=-0.0006, vmax=0.0006)
+plt.colorbar(label='Temperature difference from mean [K]')
+plt.xlabel("Y [m]")
+plt.ylabel("Time [hour]")
+plt.title("X-Time Plot of Temperature at X = 2.5 m (Median Filtered with 5x5 kernel)")
+plt.savefig("X-Time Plot of Temperature at X = 2.5 m (Median Filtered with 5x5 kernel)_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#Hovmoller図（y=2.5[m]におけるX軸方向の50格子の水温時間変化を2次元マップに落とし込む)
+#30分毎で間引き
+snapshots_diff_thinned = snapshots_diff[::30] 
+
+#y=2.5[m]のy軸方向の格子を抽出
+j_center = Ny // 2
+
+#時間×空間の水温マトリクスを作成
+T_x_matrix = np.array([snap[0][:, j_center] for snap in snapshots_diff_thinned])
+
+#5×5 メディアンフィルターを適用
+T_x_matrix_filtered = median_filter(T_x_matrix, size=(5, 5))
+
+plt.figure(figsize=(10, 6))
+extent = [0, Lx, 0, len(T_x_matrix_filtered) * 0.5]
+plt.imshow(T_x_matrix_filtered, aspect='auto', cmap='jet', origin='lower', extent=extent, interpolation='nearest', vmin=-0.0006, vmax=0.0006)
+plt.colorbar(label='Temperature difference from mean [K]')
+plt.xlabel("X [m]")
+plt.ylabel("Time [hour]")
+plt.title("Y-Time Plot of Temperature at Y = 2.5 m (Median Filtered with 5x5 kernel)")
+plt.savefig("Y-Time Plot of Temperature at Y = 2.5 m (Median Filtered with 5x5 kernel)_2000_3days_re.png", dpi=300)
+plt.show()
+plt.close()
+
+
+#最後のフレームの粒子位置を表示
+T_last, eta_last, pos_last = snapshots_diff[-1]
+rotated_pos_last = rotate_and_flip_positions(pos_last, Lx, Ly)
+
+# プロット
+plt.figure(figsize=(6, 6))
+plt.scatter(rotated_pos_last[:, 0], rotated_pos_last[:, 1], s=3, color='black', alpha=0.7)
+plt.title("Particle Distribution at the final frame")
+plt.xlim(0, Lx)
+plt.ylim(0, Ly)
+plt.xlabel("X [m]")
+plt.ylabel("Y [m]")
+plt.gca().set_aspect('equal')
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("final_particle_distribution_2000_3days_re.png", dpi=300)
+plt.show()
+
+
+end = time.time()
+
+
+#実行時間のprint
+print(f"Run time: {end - start:.2f} second")
